@@ -16,7 +16,7 @@ import torch.optim as  optim
 from tqdm import tqdm
 
 from dataset import CelebaDataset, transform
-from models import Encoder, Decoder, CVAE, loss_function
+from models import Encoder, Decoder, CVAE, loss_function, CosineScheduler
 from plots import plot_reconstructions
 
 if torch.cuda.is_available():
@@ -68,27 +68,34 @@ vae = CVAE(Encoder, Decoder)
 vae.to(device)
 
 
-
-
-
-
-
 def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval=100):
     """
-    Train the VAE model using BCE loss
+    Train the VAE model using BCE loss with beta scheduling
     """
     vae.train()
     loss_history = {
         'total': [],
         'reconstruction': [],
-        'kl': []
+        'kl': [],
+        'beta': []
     }
+
+    # Initialize beta scheduler
+    beta_scheduler = CosineScheduler(
+        start_value=0.0,  # Start with low KL weight
+        end_value=1.0,  # End with full KL weight
+        num_cycles=4,  # Number of cycles during training
+        num_epochs=num_epochs
+    )
 
     for epoch in range(num_epochs):
         pbar = tqdm(total=len(dataloader), desc=f'Epoch {epoch}')
         epoch_total_loss = 0
         epoch_recon_loss = 0
         epoch_kl_loss = 0
+
+        # Get current beta value
+        current_beta = beta_scheduler.get_value(epoch)
 
         # Store first batch for visualization
         vis_batch = None
@@ -103,8 +110,8 @@ def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval
             optimizer.zero_grad()
             recon_images, mu, logvar = vae(images, attrs)
 
-            # Compute losses
-            total_loss, recon_loss, kl_loss = loss_function(recon_images, images, mu, logvar)
+            # Compute losses with current beta value
+            total_loss, recon_loss, kl_loss = loss_function(recon_images, images, mu, logvar, current_beta)
 
             total_loss.backward()
             optimizer.step()
@@ -127,11 +134,13 @@ def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval
         loss_history['total'].append(avg_total)
         loss_history['reconstruction'].append(avg_recon)
         loss_history['kl'].append(avg_kl)
+        loss_history['beta'].append(current_beta)
 
         print(f"\nEpoch {epoch} Summary:")
         print(f"Total Loss: {avg_total:.6f}")
         print(f"BCE Loss: {avg_recon:.6f}")
-        print(f"KL Loss: {avg_kl:.6f}\n")
+        print(f"KL Loss: {avg_kl:.6f}")
+        print(f"Current Beta: {current_beta:.6f}\n")
 
         # Generate and save reconstructions
         if vis_batch is not None:
@@ -151,6 +160,7 @@ def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval
                 'model_state_dict': vae.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_total,
+                'beta': current_beta
             }, f"vae_checkpoint_epoch_{epoch}.pt")
 
     return loss_history
@@ -159,7 +169,7 @@ def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval
 # Setup training
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 vae = vae.to(device)
-optimizer = optim.Adagrad(vae.parameters(), lr=0.001)
+optimizer =  optim.Adam(vae.parameters(), lr=0.0001)  # Adjust learning rate if needed
 
 # Train the model
 loss_history = train_vae(

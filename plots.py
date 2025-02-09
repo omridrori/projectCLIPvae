@@ -1,3 +1,6 @@
+from matplotlib import pyplot as plt
+
+
 def plot_reconstructions(original_images, reconstructed_images, attrs, epoch):
     """
     Plot 5 original and reconstructed images side by side with their attributes
@@ -36,5 +39,33 @@ def plot_reconstructions(original_images, reconstructed_images, attrs, epoch):
             axes[idx, 1].axis('off')
 
     plt.tight_layout()
-    plt.savefig(f'reconstructions_epoch_{epoch}.png')
+    plt.savefig(f'/home/omrid/Desktop/jungo /projectCLIPvae/plot_reconstructions/reconstructions_epoch_{epoch}.png')
     plt.close()
+
+
+def plot_training_progress(loss_history):
+    """
+    Plot training progress including losses and beta values
+    """
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+
+    # Plot losses
+    ax1.plot(loss_history['total'], label='Total Loss')
+    ax1.plot(loss_history['reconstruction'], label='Reconstruction Loss')
+    ax1.plot(loss_history['kl'], label='KL Loss')
+    ax1.set_title('Training Losses Over Time')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Loss')
+    ax1.grid(True)
+    ax1.legend()
+
+    # Plot beta values
+    ax2.plot(loss_history['beta'], label='Beta Value', color='purple')
+    ax2.set_title('Beta Schedule Over Time')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Beta')
+    ax2.grid(True)
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.show()

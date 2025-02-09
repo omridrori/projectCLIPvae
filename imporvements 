@@ -1,0 +1,17 @@
+i want to improve it by adding to the loss fucntion the following component :
+lets say we talk about attribute has bard but in the implementation implement it for all the attributes
+
+1) take image (lets say for example with bard)
+
+4) put the image into the encoder get z
+5) decode the image with the original class embedding (in the example of image of person with bard it is embedding for bard) get original_decoded
+6) replace the embedding for the class with other class embedding (in case of binary class like has bard this is simple to put the other option- embedding for no bard but if the class has more then one attribute like hair color  simply random sample attribute ) get pertubed_decoded
+7) put original_decoded and pertubed_decoded into clip model get embeddings c_original_decoded c_pertubed_decoded
+8) put two sentences something like "a person with bard" "a person without bard"
+also to the clip model  get original_class_sentence_embed (for "a person with bard" ) and
+pertubed_class_sentence_embed
+9)punish the model if c_original_decoded is more far  from original_class_sentence_embed than c_pertubed_decoded
+and if c_pertubed_decoded is more far  from pertubed_class_sentence_embed than c_original_decoded
+
+
+

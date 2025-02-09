@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -93,13 +94,16 @@ class CVAE(nn.Module):
         return out, mu, logvar
 
 
-
-
-
-
-def loss_function(recon_x, x, mu, logvar):
+def loss_function(recon_x, x, mu, logvar, beta):
     """
-    Compute VAE loss with BCE reconstruction loss + KL divergence
+    Compute VAE loss with BCE reconstruction loss + KL divergence with beta scheduling
+
+    Args:
+        recon_x: reconstructed input
+        x: original input
+        mu: mean of the latent distribution
+        logvar: log variance of the latent distribution
+        beta: weight for the KL divergence term (from scheduler)
     """
     # BCE reconstruction loss
     recon_loss = F.binary_cross_entropy(recon_x, x, reduction='sum')
@@ -109,5 +113,38 @@ def loss_function(recon_x, x, mu, logvar):
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     KLD = KLD / (x.size(0) * 3 * 64 * 64)  # Normalize by batch size and dimensions
 
-    total_loss = recon_loss + KLD
+    # Apply beta weighting to KL divergence
+    total_loss = recon_loss + beta * KLD
     return total_loss, recon_loss, KLD
+
+
+class CosineScheduler:
+    def __init__(self, start_value, end_value, num_cycles, num_epochs):
+        """
+        Cosine annealing scheduler for beta value
+
+        Args:
+            start_value: Initial beta value
+            end_value: Final beta value
+            num_cycles: Number of cycles for the cosine schedule
+            num_epochs: Total number of epochs
+        """
+        self.start_value = start_value
+        self.end_value = end_value
+        self.num_cycles = num_cycles
+        self.num_epochs = num_epochs
+
+    def get_value(self, epoch):
+        """
+        Calculate the current beta value based on the epoch
+        """
+        # Calculate the progress within the current cycle
+        cycle_length = self.num_epochs / self.num_cycles
+        cycle_progress = (epoch % cycle_length) / cycle_length
+
+        # Calculate cosine value (0 to 1)
+        cosine_value = 0.5 * (1 + np.cos(np.pi * cycle_progress))
+
+        # Interpolate between start and end values
+        current_value = self.end_value + (self.start_value - self.end_value) * cosine_value
+        return current_value
