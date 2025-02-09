@@ -1,0 +1,7 @@
+1) insert shuffle to the encoder now we should get the same z like before since
+the category information should be encoded just in the embedding
+
+2) put shffule and original to clip and look for the distance between
+sentences for the original and shffuled
+
+
