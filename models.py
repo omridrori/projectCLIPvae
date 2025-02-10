@@ -3,6 +3,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from clip_loss import  CLIPAttributeConsistency
+
 
 class Encoder(nn.Module):
     def __init__(self):
@@ -94,28 +96,41 @@ class CVAE(nn.Module):
         return out, mu, logvar
 
 
-def loss_function(recon_x, x, mu, logvar, beta):
+def loss_function(recon_x, x, mu, logvar, vae, encoder_output, attrs,
+                      beta_vae=1.0, beta_clip=1.0, clip_consistency=None):
     """
-    Compute VAE loss with BCE reconstruction loss + KL divergence with beta scheduling
+    Enhanced VAE loss function with CLIP-based attribute manipulation loss
 
     Args:
         recon_x: reconstructed input
         x: original input
         mu: mean of the latent distribution
         logvar: log variance of the latent distribution
-        beta: weight for the KL divergence term (from scheduler)
+        vae: VAE model
+        encoder_output: full encoder output
+        attrs: attribute tensor
+        beta_vae: weight for the KL divergence term
+        beta_clip: weight for the CLIP-based attribute loss
+        clip_consistency: CLIPAttributeConsistency instance
     """
-    # BCE reconstruction loss
+    # Original VAE losses
     recon_loss = F.binary_cross_entropy(recon_x, x, reduction='sum')
-    recon_loss = recon_loss / (x.size(0) * 3 * 64 * 64)  # Normalize by batch size and dimensions
+    recon_loss = recon_loss / (x.size(0) * 3 * 64 * 64)
 
-    # KL divergence
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    KLD = KLD / (x.size(0) * 3 * 64 * 64)  # Normalize by batch size and dimensions
+    KLD = KLD / (x.size(0) * 3 * 64 * 64)
 
-    # Apply beta weighting to KL divergence
-    total_loss = recon_loss + beta * KLD
-    return total_loss, recon_loss, KLD
+    # Initialize CLIP consistency checker if not provided
+    if clip_consistency is None:
+        clip_consistency = CLIPAttributeConsistency(device=x.device)
+
+    # Compute CLIP-based attribute consistency loss
+    clip_loss = clip_consistency.compute_attribute_loss(vae, encoder_output, attrs)
+
+    # Combine all losses
+    total_loss = recon_loss + beta_vae * KLD + beta_clip * clip_loss
+
+    return total_loss, recon_loss, KLD, clip_loss
 
 
 class CosineScheduler:

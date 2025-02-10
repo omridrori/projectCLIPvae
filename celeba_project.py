@@ -15,9 +15,10 @@ from PIL import Image
 import torch.optim as  optim
 from tqdm import tqdm
 
+from clip_loss import CLIPAttributeConsistency
 from dataset import CelebaDataset, transform
 from models import Encoder, Decoder, CVAE, loss_function, CosineScheduler
-from plots import plot_reconstructions
+from plots import plot_reconstructions, save_training_visualizations
 
 if torch.cuda.is_available():
   dev = "cuda:0"
@@ -66,6 +67,7 @@ dataloader = DataLoader(
 
 vae = CVAE(Encoder, Decoder)
 vae.to(device)
+clip_consistency = CLIPAttributeConsistency(device=device)
 
 
 def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval=100):
@@ -108,10 +110,23 @@ def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval
             attrs = attrs.to(device)
 
             optimizer.zero_grad()
+
+            encoder_output = vae.encoder(images)
             recon_images, mu, logvar = vae(images, attrs)
 
             # Compute losses with current beta value
-            total_loss, recon_loss, kl_loss = loss_function(recon_images, images, mu, logvar, current_beta)
+            total_loss, recon_loss, kl_loss, clip_loss = loss_function(
+                recon_images,
+                images,
+                mu,
+                logvar,
+                vae,
+                encoder_output,
+                attrs,
+                beta_vae=1.0,
+                beta_clip=0.2,
+                clip_consistency=clip_consistency  # Pass the initialized checker
+            )
 
             total_loss.backward()
             optimizer.step()
@@ -144,14 +159,7 @@ def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval
 
         # Generate and save reconstructions
         if vis_batch is not None:
-            vae.eval()
-            with torch.no_grad():
-                vis_images, vis_attrs = vis_batch
-                vis_images = vis_images.to(device)
-                vis_attrs = vis_attrs.to(device)
-                recon_images, _, _ = vae(vis_images, vis_attrs)
-                plot_reconstructions(vis_images, recon_images, vis_attrs, epoch)
-            vae.train()
+            save_training_visualizations(vae, clip_consistency, vis_batch, epoch)
 
         # Save checkpoint at intervals
         if epoch % save_interval == 0:
