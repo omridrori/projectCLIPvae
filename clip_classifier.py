@@ -13,9 +13,16 @@ class CustomAttributeClassifier:
         self.device = device
         print(f"Initializing CLIP model on {device}")
         self.model, self.preprocess = clip.load(clip_model_name, device=device)
+        self.attribute_mappings = {}  # Will be populated when creating templates
 
     def create_text_templates(self, attribute_values: Dict[str, List[str]]) -> Dict[str, Dict[str, List[str]]]:
         templates = {}
+        # Create attribute mappings while creating templates
+        self.attribute_mappings = {
+            attr: {idx: value for idx, value in enumerate(values)}
+            for attr, values in attribute_values.items()
+        }
+
         for attr, values in attribute_values.items():
             templates[attr] = {}
             for idx, value in enumerate(values):
@@ -59,7 +66,12 @@ class CustomAttributeClassifier:
             results[attr] = []
 
         # Process images in batches
-        for i in tqdm(range(0, len(image_files), batch_size), desc="Classifying images"):
+        for i in tqdm(range(0, len(image_files), batch_size),
+                      desc="Classifying images",
+                      position=0,
+                      leave=True,
+                      dynamic_ncols=True,
+                      ascii=True):
             batch_files = image_files[i:i + batch_size]
             batch_images = []
             valid_files = []
@@ -118,9 +130,19 @@ class CustomAttributeClassifier:
         df = pd.DataFrame(results)
         print(f"\nProcessed {len(df)} images successfully")
         print("\nAttribute distribution:")
-        for attr in attribute_values.keys():
-            print(f"\n{attr}:")
-            print(df[attr].value_counts())
+        for attr, mapping in self.attribute_mappings.items():
+            print(f"\n{attr.capitalize()} Distribution:")
+            print("-" * 30)
+
+            # Get value counts and calculate percentages
+            counts = df[attr].value_counts().sort_index()
+            total = len(df)
+
+            # Print each category with count and percentage
+            for idx in sorted(mapping.keys()):
+                count = counts.get(idx, 0)
+                percentage = (count / total) * 100
+                print(f"{mapping[idx]:<25}: {count:>6,} ({percentage:>6.1f}%)")
 
         return df
 

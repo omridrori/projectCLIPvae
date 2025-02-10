@@ -137,9 +137,8 @@ def plot_reconstructions_with_perturbations(original_images, reconstructed_image
                 ax.axis('off')
 
     plt.tight_layout()
-    plt.savefig(f'plot_reconstructions/reconstructions_epoch_{epoch}.png')
+    plt.savefig(os.path.join(save_dir, f'visualizations_epoch_{epoch}.png'))
     plt.close()
-
 
 def generate_perturbation_samples(vae, clip_consistency, images, attrs, device):
     """
@@ -183,7 +182,7 @@ def generate_perturbation_samples(vae, clip_consistency, images, attrs, device):
         return recon_images, perturbed_images, perturbed_attrs, attr_indices
 
 
-def save_training_visualizations(vae, clip_consistency, vis_batch, epoch):
+def save_training_visualizations(vae, clip_consistency, vis_batch, epoch, save_dir):
     """
     Generate and save training visualizations
     """
@@ -199,5 +198,5 @@ def save_training_visualizations(vae, clip_consistency, vis_batch, epoch):
     # Plot results
     plot_reconstructions_with_perturbations(
         images, recon_images, perturbed_images,
-        attrs, perturbed_attrs, attr_indices, epoch
+        attrs, perturbed_attrs, attr_indices, epoch, save_dir  # Add save_dir here
     )
