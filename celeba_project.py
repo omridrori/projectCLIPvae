@@ -1,103 +1,169 @@
-from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import torch
-import torchvision
-import torch.nn as nn
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
 import os
-from PIL import Image
+import tempfile
 
-import torch.optim as  optim
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import torchvision.transforms as transforms
+from dotenv import load_dotenv
 
+from models import CVAE, loss_function
+from dataset import CelebaDataset
+from clip_classifier import CustomAttributeClassifier
 from clip_loss import CLIPAttributeConsistency
-from dataset import CelebaDataset, transform
-from models import Encoder, Decoder, CVAE, loss_function, CosineScheduler
-from plots import plot_reconstructions, save_training_visualizations
+from utils import (validate_attribute_config,
+                   convert_clip_to_vae_format,
+                   create_attribute_noise)
+from plots import (plot_reconstructions_with_perturbations,
+                   plot_training_progress,
+                   plot_attribute_distributions)
 
-if torch.cuda.is_available():
-  dev = "cuda:0"
-  print("gpu up")
-else:
-  dev = "cpu"
-device = torch.device(dev)
-
-df = pd.read_csv("celeba_dataset/list_attr_celeba.csv")
-
-def haircolor(x):
-    if x["Blond_Hair"] == 1:
-        return 0
-    elif x["Brown_Hair"] == 1:
-        return 1
-    elif x["Black_Hair"] == 1:
-        return 2
-    else:
-        return 3
+# Define transform for images
+transform = transforms.Compose([
+    transforms.Resize((64, 64)),
+    transforms.ToTensor(),
+])
 
 
-df["Hair_Color"] = df.apply(haircolor, axis=1)
-
-df = df[["image_id","Hair_Color",'Pale_Skin',"Male","No_Beard"]]
-df.Pale_Skin = df.Pale_Skin.apply(lambda x: max(x,0))
-df.Male = df.Male.apply(lambda x: max(x,0))
-df.No_Beard = df.No_Beard.apply(lambda x: max(x,0))
-
-
-
-# Initialize dataset and dataloader
-dataset = CelebaDataset(
-    df=df,
-    img_dir = "/home/omrid/Desktop/jungo /projectCLIPvae/celeba_dataset/img_align_celeba/img_align_celeba/",
-    transform=transform
-)
-
-dataloader = DataLoader(
-    dataset,
-    batch_size=128,
-    shuffle=True,
-    num_workers=4,  # Parallel data loading
-)
-
-
-
-vae = CVAE(Encoder, Decoder)
-vae.to(device)
-clip_consistency = CLIPAttributeConsistency(device=device)
-
-
-def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval=100):
+def generate_clip_labels(user_attributes, img_dir, max_images=100):
     """
-    Train the VAE model using BCE loss with beta scheduling
+    Generate labels for images using CLIP classifier.
+
+    Args:
+        user_attributes: Dictionary of attribute names and their possible values
+        img_dir: Directory containing the images
+        max_images: Maximum number of images to process
+
+    Returns:
+        results_df: DataFrame containing image IDs and their attribute classifications
+
+    Raises:
+        ValueError: If no valid images are found or processing fails
     """
-    vae.train()
+    print("Generating labels using CLIP...")
+
+    # Load environment variables
+    load_dotenv()
+
+    # Get the API key
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    # Create the classifier with explicit API key
+    classifier = CustomAttributeClassifier(
+        clip_model_name="ViT-B/16",
+        openai_api_key=api_key
+    )
+
+    # Validate directory exists
+    if not os.path.exists(img_dir):
+        raise ValueError(f"Image directory not found: {img_dir}")
+
+    # Get list of all image files
+    image_files = [f for f in os.listdir(img_dir)
+                   if f.lower().endswith(('.jpg', '.png', '.jpeg'))]
+
+    if not image_files:
+        raise ValueError(f"No valid image files found in {img_dir}")
+
+    # Take only first max_images
+    selected_files = image_files[:max_images]
+    print(f"\nProcessing {len(selected_files)} images out of {len(image_files)} total images")
+
+    # Create a temporary directory with symlinks to selected images
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create symlinks for selected images
+        for img_file in selected_files:
+            src = os.path.join(img_dir, img_file)
+            dst = os.path.join(temp_dir, img_file)
+            if os.path.exists(src):
+                os.symlink(src, dst)
+
+        # Classify only selected images
+        results_df = classifier.classify_images(
+            img_dir=temp_dir,
+            attribute_values=user_attributes,
+            batch_size=16
+        )
+
+    # Validate results
+    if results_df is None or len(results_df) == 0:
+        raise ValueError(
+            "CLIP classification failed to produce any valid results. Please check your input data and paths.")
+
+    return results_df
+
+
+def train_vae_model(results_df, user_attributes, img_dir, device="cuda",
+                    batch_size=32, num_epochs=100, vis_dir="training_outputs"):
+    """
+    Train the VAE model using CLIP-generated labels.
+
+    Args:
+        results_df: DataFrame with CLIP-generated labels
+        user_attributes: Dictionary of attribute names and their possible values
+        img_dir: Directory containing images
+        device: Device to run training on
+        batch_size: Training batch size
+        num_epochs: Number of training epochs
+        vis_dir: Directory to save visualizations
+    """
+    print("\nPreparing for training...")
+
+    # Convert CLIP results to VAE format
+    vae_df, attribute_dims = convert_clip_to_vae_format(
+        results_df,
+        list(user_attributes.keys())
+    )
+
+    # Initialize dataset and dataloader
+    dataset = CelebaDataset(
+        df=vae_df,
+        img_dir=img_dir,
+        transform=transform,
+        attribute_names=list(user_attributes.keys())
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    # Initialize models
+    vae = CVAE(attribute_dims=attribute_dims).to(device)
+    clip_consistency = CLIPAttributeConsistency(device=device)
+
+    # Register templates with CLIP consistency checker
+    clip_consistency.generate_default_templates(dataset.get_attribute_info())
+
+    # Initialize optimizer
+    optimizer = optim.Adam(vae.parameters(), lr=0.0001)
+
+    # Initialize loss history
     loss_history = {
         'total': [],
         'reconstruction': [],
         'kl': [],
-        'beta': []
+        'clip': []
     }
 
-    # Initialize beta scheduler
-    beta_scheduler = CosineScheduler(
-        start_value=0.0,  # Start with low KL weight
-        end_value=1.0,  # End with full KL weight
-        num_cycles=4,  # Number of cycles during training
-        num_epochs=num_epochs
-    )
+    print("\nStarting training...")
+    os.makedirs(vis_dir, exist_ok=True)
 
+    # Training loop
     for epoch in range(num_epochs):
-        pbar = tqdm(total=len(dataloader), desc=f'Epoch {epoch}')
-        epoch_total_loss = 0
-        epoch_recon_loss = 0
-        epoch_kl_loss = 0
+        vae.train()
+        epoch_losses = {k: 0.0 for k in loss_history.keys()}
 
-        # Get current beta value
-        current_beta = beta_scheduler.get_value(epoch)
+        pbar = tqdm(total=len(dataloader),
+                    desc=f'Epoch {epoch}/{num_epochs}',
+                    position=0,
+                    leave=True,
+                    dynamic_ncols=True)
 
         # Store first batch for visualization
         vis_batch = None
@@ -111,88 +177,92 @@ def train_vae(vae, dataloader, optimizer, device, num_epochs=1201, save_interval
 
             optimizer.zero_grad()
 
-            encoder_output = vae.encoder(images)
+            # Forward pass
             recon_images, mu, logvar = vae(images, attrs)
 
-            # Compute losses with current beta value
+            # Compute losses
             total_loss, recon_loss, kl_loss, clip_loss = loss_function(
-                recon_images,
-                images,
-                mu,
-                logvar,
-                vae,
-                encoder_output,
-                attrs,
+                recon_images, images, mu, logvar,
+                clip_consistency=clip_consistency,
+                attrs=attrs,
+                attribute_names=list(user_attributes.keys()),
                 beta_vae=1.0,
-                beta_clip=0.2,
-                clip_consistency=clip_consistency  # Pass the initialized checker
+                beta_clip=1
             )
 
+            # Backward pass
             total_loss.backward()
             optimizer.step()
 
-            # Accumulate losses
-            epoch_total_loss += total_loss.item()
-            epoch_recon_loss += recon_loss.item()
-            epoch_kl_loss += kl_loss.item()
+            # Update loss tracking
+            epoch_losses['total'] += total_loss.item()
+            epoch_losses['reconstruction'] += recon_loss.item()
+            epoch_losses['kl'] += kl_loss.item()
+            epoch_losses['clip'] += clip_loss.item()
 
             pbar.update(1)
 
         pbar.close()
 
-        # Calculate averages
-        avg_total = epoch_total_loss / len(dataloader)
-        avg_recon = epoch_recon_loss / len(dataloader)
-        avg_kl = epoch_kl_loss / len(dataloader)
+        # Average losses
+        for k in epoch_losses:
+            avg_loss = epoch_losses[k] / len(dataloader)
+            loss_history[k].append(avg_loss)
 
-        # Store in history
-        loss_history['total'].append(avg_total)
-        loss_history['reconstruction'].append(avg_recon)
-        loss_history['kl'].append(avg_kl)
-        loss_history['beta'].append(current_beta)
+        # Print progress on same line
+        loss_str = f"Epoch {epoch}/{num_epochs} | " + " | ".join(
+            [f"{k.capitalize()}: {v / len(dataloader):.6f}" for k, v in epoch_losses.items()]
+        )
+        tqdm.write(loss_str)
 
-        print(f"\nEpoch {epoch} Summary:")
-        print(f"Total Loss: {avg_total:.6f}")
-        print(f"BCE Loss: {avg_recon:.6f}")
-        print(f"KL Loss: {avg_kl:.6f}")
-        print(f"Current Beta: {current_beta:.6f}\n")
+        # Save visualizations and checkpoint every 10 epochs
+        if epoch % 1 == 0:
+            if vis_batch is not None:
+                vae.eval()
+                with torch.no_grad():
+                    images, attrs = vis_batch
+                    images = images.to(device)
+                    attrs = attrs.to(device)
 
-        # Generate and save reconstructions
-        if vis_batch is not None:
-            save_training_visualizations(vae, clip_consistency, vis_batch, epoch)
+                    # Get reconstructions
+                    recon_images, mu, logvar = vae(images, attrs)
 
-        # Save checkpoint at intervals
-        if epoch % save_interval == 0:
-            torch.save({
+                    # Create perturbed versions
+                    perturbed_attrs = attrs.clone()
+                    for i in range(len(perturbed_attrs)):
+                        attr_idx = torch.randint(0, len(user_attributes), (1,)).item()
+                        current_val = perturbed_attrs[i, attr_idx].item()
+                        num_values = len(user_attributes[list(user_attributes.keys())[attr_idx]])
+                        new_val = (current_val + torch.randint(1, num_values, (1,)).item()) % num_values
+                        perturbed_attrs[i, attr_idx] = new_val
+
+                    # Generate perturbed images
+                    perturbed_z = torch.cat([mu, perturbed_attrs], dim=1)
+                    perturbed_images = vae.decoder(perturbed_z)
+
+                    # Plot results
+                    plot_reconstructions_with_perturbations(
+                        images, recon_images, perturbed_images,
+                        attrs, perturbed_attrs,
+                        list(user_attributes.keys()),
+                        user_attributes,
+                        epoch,
+                        vis_dir
+                    )
+
+            # Save checkpoint
+            checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': vae.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_total,
-                'beta': current_beta
-            }, f"vae_checkpoint_epoch_{epoch}.pt")
+                'loss': loss_history,
+                'attribute_dims': attribute_dims
+            }
+            torch.save(checkpoint, os.path.join(vis_dir, f'checkpoint_epoch_{epoch}.pt'))
 
-    return loss_history
+            # Save training progress plot
+            plot_training_progress(loss_history, vis_dir)
+
+    return vae, loss_history
 
 
-# Setup training
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-vae = vae.to(device)
-optimizer =  optim.Adam(vae.parameters(), lr=0.0001)  # Adjust learning rate if needed
-
-# Train the model
-loss_history = train_vae(
-    vae=vae,
-    dataloader=dataloader,
-    optimizer=optimizer,
-    device=device,
-    num_epochs=1201,
-    save_interval=100
-)
-# Plot training progress
-plt.figure(figsize=(10, 5))
-plt.plot(loss_history)
-plt.title('Training Loss Over Time')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.grid(True)
-plt.show()

@@ -1,166 +1,205 @@
 import torch
 import torch.nn.functional as F
 import clip
-from random import choice
+from typing import Dict, List, Union
+import random
 
 
 class CLIPAttributeConsistency:
-    def __init__(self, clip_model_name="ViT-B/32", device="cuda"):
+    def __init__(self, clip_model_name: str = "ViT-B/32", device: str = "cuda"):
+        """
+        Initialize CLIP-based attribute consistency checker.
+
+        Args:
+            clip_model_name: Name of the CLIP model to use
+            device: Device to run the model on
+        """
         self.device = device
         self.model, self.preprocess = clip.load(clip_model_name, device=device)
+        self.attribute_templates = {}
 
-        self.attribute_templates = {
-            'hair_color': {
-                0: ["a photo of a person with blonde hair", "a face with blonde hair"],
-                1: ["a photo of a person with brown hair", "a face with brown hair"],
-                2: ["a photo of a person with black hair", "a face with black hair"],
-                3: ["a photo of a person with red hair", "a face with red hair"]
-            },
-            'pale_skin': {
-                0: ["a photo of a person with dark skin", "a dark-skinned person"],
-                1: ["a photo of a person with pale skin", "a pale-skinned person"]
-            },
-            'gender': {
-                0: ["a photo of a woman", "a female face"],
-                1: ["a photo of a man", "a male face"]
-            },
-            'beard': {
-                0: ["a photo of a person without a beard", "a face without facial hair"],
-                1: ["a photo of a person with a beard", "a face with a beard"]
-            }
-        }
+    def register_templates(self, templates: Dict[str, Dict[int, List[str]]]):
+        """
+        Register templates for attributes.
+
+        Args:
+            templates: Dictionary of attribute templates in the format:
+                {
+                    'attribute_name': {
+                        value_index: ['template1', 'template2', ...],
+                        ...
+                    },
+                    ...
+                }
+        """
+        self.attribute_templates = templates
+
+    def generate_default_templates(self, attribute_info: Dict[str, Dict]):
+        """
+        Generate default templates for attributes if none are provided.
+
+        Args:
+            attribute_info: Dictionary containing attribute information:
+                {
+                    'attribute_name': {
+                        'num_values': int,
+                        'values': List[str/int]
+                    },
+                    ...
+                }
+        """
+        templates = {}
+
+        for attr_name, info in attribute_info.items():
+            templates[attr_name] = {}
+
+            for idx, value in enumerate(info['values']):
+                # Convert value to string if it's not already
+                value_str = str(value).lower().replace('_', ' ')
+
+                # Generate multiple templates for each value
+                templates[attr_name][idx] = [
+                    f"a photo of a person with {value_str} features",
+                    f"a {value_str} person",
+                    f"a face showing {value_str} characteristics",
+                    f"a portrait of someone with {value_str} appearance",
+                    f"a photograph depicting {value_str} traits"
+                ]
+
+        self.attribute_templates = templates
 
     @torch.no_grad()
-    def get_image_features(self, images):
-        """Get normalized CLIP image features"""
+    def get_image_features(self, images: torch.Tensor) -> torch.Tensor:
+        """Get normalized CLIP image features."""
+        # Resize images to CLIP input size
         images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
         image_features = self.model.encode_image(images)
         return image_features / image_features.norm(dim=-1, keepdim=True)
 
     @torch.no_grad()
-    def get_text_features(self, descriptions):
-        """Get normalized CLIP text features for a list of descriptions"""
+    def get_text_features(self, descriptions: List[str]) -> torch.Tensor:
+        """Get normalized CLIP text features."""
         text_tokens = clip.tokenize(descriptions).to(self.device)
         text_features = self.model.encode_text(text_tokens)
         return text_features / text_features.norm(dim=-1, keepdim=True)
 
-    def compute_attribute_loss(self, vae, encoder_output, attrs):
+    def compute_attribute_loss(self, images: torch.Tensor, attrs: torch.Tensor,
+                               attribute_names: List[str]) -> torch.Tensor:
         """
-        Compute CLIP-based attribute consistency loss for entire batch in parallel
+        Compute CLIP-based attribute consistency loss for a batch.
+
+        Args:
+            images: Batch of images
+            attrs: Tensor of attribute values
+            attribute_names: List of attribute names in order
+
+        Returns:
+            torch.Tensor: Computed loss
         """
-        batch_size = attrs.size(0)
+        if not self.attribute_templates:
+            raise ValueError("No templates registered. Call register_templates first.")
 
-        # Get latent representations
-        z = encoder_output[:, :64]  # [batch_size, 64]
+        batch_size = images.size(0)
+        total_loss = torch.tensor(0.0, device=self.device)
+        num_attributes = len(attribute_names)
 
-        # Randomly select attributes to manipulate for each image in batch
-        attr_indices = torch.randint(0, 4, (batch_size,), device=attrs.device)  # [batch_size]
+        # Get image features once
+        image_features = self.get_image_features(images)
 
-        # Create mask for multiclass (hair_color) vs binary attributes
-        is_hair_color = (attr_indices == 0)
+        # For each image in the batch, randomly select an attribute to verify
+        for i in range(batch_size):
+            # Randomly select an attribute to verify
+            attr_idx = random.randint(0, num_attributes - 1)
+            attr_name = attribute_names[attr_idx]
 
-        # Get original attribute values
-        orig_attr_vals = torch.gather(attrs, 1, attr_indices.unsqueeze(1)).squeeze(1)  # [batch_size]
+            # Get the actual value for this attribute
+            current_value = attrs[i, attr_idx].item()
 
-        # Create perturbed attributes tensor
-        perturbed_attrs = attrs.clone().float()  # [batch_size, num_attrs]
+            # Get templates for the current value
+            if current_value not in self.attribute_templates[attr_name]:
+                continue
 
-        # Handle hair color (4 classes)
-        hair_mask = is_hair_color
-        if hair_mask.any():
-            # For hair color, randomly select a different class
-            new_hair_vals = torch.randint(0, 4, (hair_mask.sum(),), device=attrs.device).float()
-            # Make sure new values are different from original
-            same_hair = new_hair_vals == orig_attr_vals[hair_mask]
-            if same_hair.any():
-                new_hair_vals[same_hair] = (new_hair_vals[same_hair] + 1) % 4
-            perturbed_attrs[hair_mask, 0] = new_hair_vals
+            current_templates = self.attribute_templates[attr_name][current_value]
 
-        # Handle binary attributes
-        binary_mask = ~is_hair_color
-        if binary_mask.any():
-            # For binary attributes, flip the value
-            binary_indices = attr_indices[binary_mask]
-            perturbed_attrs[binary_mask, binary_indices] = 1 - orig_attr_vals[binary_mask]
+            # Select a different value for contrast
+            possible_values = list(self.attribute_templates[attr_name].keys())
+            possible_values.remove(current_value)
+            contrast_value = random.choice(possible_values)
+            contrast_templates = self.attribute_templates[attr_name][contrast_value]
 
-        # Get reconstructions for entire batch
-        with torch.no_grad():
-            # Original reconstructions
-            orig_decoded = vae.decoder(torch.cat([z, attrs], dim=1))
+            # Get text features for both current and contrast templates
+            current_text_features = self.get_text_features(current_templates)
+            contrast_text_features = self.get_text_features(contrast_templates)
 
-            # Perturbed reconstructions
-            perturbed_decoded = vae.decoder(torch.cat([z, perturbed_attrs], dim=1))
+            # Compute similarities
+            current_sim = (image_features[i:i + 1] @ current_text_features.T).mean()
+            contrast_sim = (image_features[i:i + 1] @ contrast_text_features.T).mean()
 
-            # Get CLIP embeddings for all images
-            orig_features = self.get_image_features(orig_decoded)
-            perturbed_features = self.get_image_features(perturbed_decoded)
-
-            # Initialize lists for text features
-            all_orig_text_features = []
-            all_perturbed_text_features = []
-
-            # Get text features for each attribute type
-            attr_names = ['hair_color', 'pale_skin', 'gender', 'beard']
-            for attr_type in range(4):
-                mask = (attr_indices == attr_type)
-                if not mask.any():
-                    continue
-
-                # Get original descriptions
-                orig_descriptions = []
-                for idx in range(batch_size):
-                    if mask[idx]:
-                        orig_descriptions.extend(
-                            self.attribute_templates[attr_names[attr_type]][int(orig_attr_vals[idx].item())]
-                        )
-
-                # Get perturbed descriptions
-                perturbed_descriptions = []
-                for idx in range(batch_size):
-                    if mask[idx]:
-                        perturbed_descriptions.extend(
-                            self.attribute_templates[attr_names[attr_type]][int(perturbed_attrs[idx, attr_type].item())]
-                        )
-
-                if orig_descriptions:  # If we have any descriptions for this attribute
-                    orig_text_features = self.get_text_features(orig_descriptions)
-                    perturbed_text_features = self.get_text_features(perturbed_descriptions)
-
-                    # Reshape to account for multiple descriptions per image
-                    num_desc = len(self.attribute_templates[attr_names[attr_type]][0])
-                    orig_text_features = orig_text_features.view(-1, num_desc, orig_text_features.size(-1))
-                    perturbed_text_features = perturbed_text_features.view(-1, num_desc,
-                                                                           perturbed_text_features.size(-1))
-
-                    all_orig_text_features.append((mask, orig_text_features))
-                    all_perturbed_text_features.append((mask, perturbed_text_features))
-
-            # Compute losses for each attribute type and combine
-            total_loss = 0
+            # Compute contrastive loss with margin
             margin = 0.2
+            loss = torch.relu(contrast_sim - current_sim + margin)
+            total_loss += loss
 
-            for (mask, orig_text), (_, perturbed_text) in zip(all_orig_text_features, all_perturbed_text_features):
-                if not mask.any():
-                    continue
+        # Normalize by batch size
+        return total_loss / batch_size
 
-                # Compute similarities for masked batch
-                orig_features_masked = orig_features[mask]
-                perturbed_features_masked = perturbed_features[mask]
+    def verify_single_attribute(self, image: torch.Tensor, attr_name: str,
+                                attr_value: int) -> float:
+        """
+        Verify a single attribute value for an image.
 
-                # Compute mean similarity across multiple descriptions
-                orig_sim = (orig_features_masked @ orig_text.mean(dim=1).t()).mean(dim=1)
-                perturbed_sim = (perturbed_features_masked @ perturbed_text.mean(dim=1).t()).mean(dim=1)
+        Args:
+            image: Single image tensor
+            attr_name: Name of the attribute to verify
+            attr_value: Value of the attribute to verify
 
-                # Cross similarities
-                cross_orig_sim = (orig_features_masked @ perturbed_text.mean(dim=1).t()).mean(dim=1)
-                cross_perturbed_sim = (perturbed_features_masked @ orig_text.mean(dim=1).t()).mean(dim=1)
+        Returns:
+            float: Confidence score for the attribute (0 to 1)
+        """
+        with torch.no_grad():
+            # Get image features
+            image_features = self.get_image_features(image.unsqueeze(0))
 
-                # Compute contrastive loss
-                loss = (
-                        torch.relu(cross_orig_sim - orig_sim + margin) +
-                        torch.relu(cross_perturbed_sim - perturbed_sim + margin)
-                ).mean()
+            # Get templates for this attribute value
+            templates = self.attribute_templates[attr_name][attr_value]
 
-                total_loss += loss
+            # Get text features
+            text_features = self.get_text_features(templates)
 
-            return total_loss / len(all_orig_text_features)
+            # Compute similarity
+            similarity = (image_features @ text_features.T).mean().item()
+
+            # Convert to probability
+            return torch.sigmoid(torch.tensor(similarity * 100.0)).item()
+
+    def batch_verify_attributes(self, images: torch.Tensor,
+                                attrs: torch.Tensor,
+                                attribute_names: List[str]) -> torch.Tensor:
+        """
+        Verify all attributes for a batch of images.
+
+        Args:
+            images: Batch of images
+            attrs: Tensor of attribute values
+            attribute_names: List of attribute names in order
+
+        Returns:
+            torch.Tensor: Tensor of confidence scores for each attribute
+        """
+        batch_size = images.size(0)
+        num_attributes = len(attribute_names)
+        confidences = torch.zeros(batch_size, num_attributes, device=self.device)
+
+        with torch.no_grad():
+            image_features = self.get_image_features(images)
+
+            for attr_idx, attr_name in enumerate(attribute_names):
+                for i in range(batch_size):
+                    attr_value = attrs[i, attr_idx].item()
+                    templates = self.attribute_templates[attr_name][attr_value]
+                    text_features = self.get_text_features(templates)
+
+                    similarity = (image_features[i:i + 1] @ text_features.T).mean()
+                    confidences[i, attr_idx] = torch.sigmoid(similarity * 100.0)
+
+        return confidences

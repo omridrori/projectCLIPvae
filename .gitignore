@@ -8,3 +8,10 @@
 *.xml
 /.idea
 .idea/modules.xml
+*.pyc
+*.pyc
+*.pt
+*.pyc
+*.pyc
+/__pycache__
+/__pycache__
