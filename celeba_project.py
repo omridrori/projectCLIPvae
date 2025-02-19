@@ -96,9 +96,10 @@ def generate_clip_labels(user_attributes, img_dir, max_images=100):
 
 
 def train_vae_model(results_df, user_attributes, img_dir, device="cuda",
-                    batch_size=32, num_epochs=100, vis_dir="training_outputs"):
+                    batch_size=32, num_epochs=100, vis_dir="training_outputs",
+                    resampling_strategy='oversample'):
     """
-    Train the VAE model using CLIP-generated labels.
+    Train the VAE model using resampling strategies for handling imbalanced data.
 
     Args:
         results_df: DataFrame with CLIP-generated labels
@@ -108,6 +109,7 @@ def train_vae_model(results_df, user_attributes, img_dir, device="cuda",
         batch_size: Training batch size
         num_epochs: Number of training epochs
         vis_dir: Directory to save visualizations
+        resampling_strategy: One of ['none', 'oversample', 'undersample', 'smote']
     """
     print("\nPreparing for training...")
 
@@ -117,13 +119,36 @@ def train_vae_model(results_df, user_attributes, img_dir, device="cuda",
         list(user_attributes.keys())
     )
 
-    # Initialize dataset and dataloader
+    # Print initial class distribution
+    print("\nInitial class distribution:")
+    for attr in user_attributes.keys():
+        print(f"\n{attr} distribution:")
+        counts = vae_df[attr].value_counts().sort_index()
+        total = len(vae_df)
+        for idx, count in counts.items():
+            value = user_attributes[attr][idx]
+            percentage = (count / total) * 100
+            print(f"{value:<20}: {count:>6,} ({percentage:>6.1f}%)")
+
+    # Initialize dataset with resampling
     dataset = CelebaDataset(
         df=vae_df,
         img_dir=img_dir,
         transform=transform,
-        attribute_names=list(user_attributes.keys())
+        attribute_names=list(user_attributes.keys()),
+        resampling_strategy=resampling_strategy
     )
+
+    # Print resampled class distribution
+    print(f"\nClass distribution after {resampling_strategy}:")
+    for attr in user_attributes.keys():
+        print(f"\n{attr} distribution:")
+        counts = dataset.df[attr].value_counts().sort_index()
+        total = len(dataset.df)
+        for idx, count in counts.items():
+            value = user_attributes[attr][idx]
+            percentage = (count / total) * 100
+            print(f"{value:<20}: {count:>6,} ({percentage:>6.1f}%)")
 
     dataloader = DataLoader(
         dataset,
@@ -136,11 +161,7 @@ def train_vae_model(results_df, user_attributes, img_dir, device="cuda",
     # Initialize models
     vae = CVAE(attribute_dims=attribute_dims).to(device)
     clip_consistency = CLIPAttributeConsistency(device=device)
-
-    # Register templates with CLIP consistency checker
     clip_consistency.generate_default_templates(dataset.get_attribute_info())
-
-    # Initialize optimizer
     optimizer = optim.Adam(vae.parameters(), lr=0.0001)
 
     # Initialize loss history
